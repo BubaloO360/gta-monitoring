@@ -8,6 +8,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from html.parser import HTMLParser
 from pathlib import Path
 
 try:
@@ -15,6 +16,7 @@ try:
 except ImportError:
     Image = ImageDraw = ImageFont = None
 
+SITE_URL = "https://portwatch-vi.xyz/"
 TRACKER_URL = "https://portwatch-vi.xyz/data/tracker.json"
 DISPLAY_URL = "https://portwatch-vi.xyz/#top"
 STATE_FILE = Path("state.json")
@@ -27,17 +29,42 @@ USER_AGENT = (
 
 MILESTONES = [
     ("groundwork", "Preparação", 0),
-    ("loads", "Exe rodando", 25),
-    ("boots", "Primeiro frame", 40),
-    ("menu", "Menu principal", 55),
-    ("ingame", "Dentro do jogo", 70),
-    ("fps30", "30 FPS", 85),
-    ("stable", "Estável", 100),
+    ("loads", "Exe rodando", 10),
+    ("boots", "Primeiro frame", 20),
+    ("menu", "Menu principal", 30),
+    ("world", "No mundo", 40),
+    ("playable", "Jogável", 50),
+    ("complete", "Completo", 100),
 ]
 TICK = {key: at for key, _, at in MILESTONES}
 MILESTONE_LABEL = {key: label for key, label, _ in MILESTONES}
 MILESTONE_IDX = {key: idx for idx, (key, _, _) in enumerate(MILESTONES)}
-LADDER = ["loads", "boots", "menu", "ingame"]
+LADDER = ["loads", "boots", "menu", "world", "playable"]
+
+TRACKS = [
+    ("story", "História", 0.35),
+    ("render", "Renderização", 0.25),
+    ("perf", "Desempenho", 0.20),
+    ("stability", "Estabilidade", 0.20),
+]
+
+STORY_STEPS_PT = [
+    (0.0, "Preso na abertura"),
+    (0.1, "Prólogo concluído"),
+    (0.25, "Primeiras missões"),
+    (0.4, "Primeiro ato"),
+    (0.6, "Metade da história"),
+    (0.85, "História até os créditos"),
+    (1.0, "100% concluído"),
+]
+
+RENDER_STEPS_PT = [
+    (0.0, "Preto ou quebrado"),
+    (0.25, "Formas sem iluminação"),
+    (0.5, "Iluminado, sem efeitos"),
+    (0.75, "Próximo ao console"),
+    (1.0, "Igual ao console"),
+]
 
 GROUNDWORK = [
     ("loader", 0.2),
@@ -61,15 +88,6 @@ STABILITY_LABEL_PT = {
     "often": "Trava com frequência",
     "sometimes": "Trava às vezes",
     "rarely": "Raramente trava",
-    "stable": "Estável",
-}
-
-STABILITY_BAR_PT = {
-    "unknown": "Estável",
-    "constant": "Instável",
-    "often": "Trava muito",
-    "sometimes": "Às vezes",
-    "rarely": "Quase estável",
     "stable": "Estável",
 }
 
@@ -104,6 +122,27 @@ def groundwork_fraction(gw) -> float:
     return sum(weight * clamp01(gw.get(key)) for key, weight in GROUNDWORK)
 
 
+def track_values(gta: dict) -> dict:
+    try:
+        fps_num = float(gta.get("fps") or 0)
+    except (TypeError, ValueError):
+        fps_num = 0.0
+    return {
+        "story": clamp01(gta.get("story")),
+        "render": clamp01(gta.get("render")),
+        "perf": clamp01(fps_num / 30.0),
+        "stability": STABILITY.get(gta.get("stability"), STABILITY["unknown"]),
+    }
+
+
+def track_step_label(steps: list[tuple[float, str]], value: float) -> str:
+    v = clamp01(value)
+    for threshold, label in reversed(steps):
+        if v >= threshold:
+            return label
+    return steps[0][1]
+
+
 def score_effort(effort: dict) -> dict:
     gw = groundwork_fraction(effort.get("groundwork"))
     gta = effort.get("gta") or {}
@@ -122,22 +161,12 @@ def score_effort(effort: dict) -> dict:
             score = max(score, prev_tick + v * (TICK[key] - prev_tick))
         break
 
-    if reached == "ingame":
-        try:
-            fps_num = float(gta.get("fps") or 0)
-        except (TypeError, ValueError):
-            fps_num = 0.0
-        fps = clamp01(fps_num / 30.0)
-        stab = STABILITY.get(gta.get("stability"), STABILITY["unknown"])
-        score = (
-            TICK["ingame"]
-            + fps * (TICK["fps30"] - TICK["ingame"])
-            + stab * (TICK["stable"] - TICK["fps30"])
-        )
-        if fps >= 1.0:
-            reached = "fps30"
-        if fps >= 1.0 and stab >= 1.0:
-            reached = "stable"
+    tracks = track_values(gta)
+    quality = sum(weight * tracks[key] for key, _, weight in TRACKS)
+    if reached == "playable":
+        score = TICK["playable"] + quality * (TICK["complete"] - TICK["playable"])
+        if quality >= 1.0:
+            reached = "complete"
 
     manual_score = effort.get("manualScore")
     if (
@@ -152,6 +181,8 @@ def score_effort(effort: dict) -> dict:
         "groundwork": gw,
         "reached": reached,
         "reached_label": MILESTONE_LABEL[reached],
+        "tracks": tracks,
+        "playable": reached in ("playable", "complete"),
     }
 
 
@@ -178,6 +209,7 @@ def load_state() -> dict:
     default = {
         "last_score": None,
         "last_leader": None,
+        "last_pin_key": None,
         "notified_90": False,
         "notified_100": False,
     }
@@ -198,7 +230,7 @@ def fetch_tracker() -> dict:
         headers={
             "User-Agent": USER_AGENT,
             "Accept": "application/json, */*",
-            "Referer": "https://portwatch-vi.xyz/",
+            "Referer": SITE_URL,
         },
         method="GET",
     )
@@ -212,6 +244,102 @@ def fetch_tracker() -> dict:
     except json.JSONDecodeError:
         raise RuntimeError("Resposta inválida (JSON corrompido) em tracker.json.") from None
 
+
+# ---------- Leitura do quadro fixado (#pinned) ----------
+
+class _PinnedHTMLParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.in_aside = False
+        self.aside_depth = 0
+        self.capture = None
+        self.author_parts: list[str] = []
+        self.text_parts: list[str] = []
+        self.datetime_val = ""
+
+    def handle_starttag(self, tag, attrs):
+        attr_map = dict(attrs)
+        classes = set((attr_map.get("class") or "").split())
+
+        if not self.in_aside:
+            if tag == "aside" and (attr_map.get("id") == "pinned" or "pinned" in classes):
+                self.in_aside = True
+                self.aside_depth = 1
+            return
+
+        self.aside_depth += 1
+        if "pin-name" in classes:
+            self.capture = "author"
+        elif "pin-text" in classes:
+            self.capture = "text"
+        elif "pin-time" in classes and attr_map.get("datetime"):
+            self.datetime_val = attr_map["datetime"].strip()
+        elif tag == "br" and self.capture == "text":
+            self.text_parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if not self.in_aside:
+            return
+        if self.capture in ("author", "text") and tag in ("b", "p", "span", "div"):
+            self.capture = None
+        self.aside_depth -= 1
+        if self.aside_depth <= 0:
+            self.in_aside = False
+
+    def handle_data(self, data):
+        if self.capture == "author":
+            self.author_parts.append(data)
+        elif self.capture == "text":
+            self.text_parts.append(data)
+
+
+def extract_pinned_from_tracker(data: dict) -> dict | None:
+    for key in ("pinned", "pin", "pinnedMessage", "notice", "announcement"):
+        val = data.get(key)
+        if not val:
+            continue
+        if isinstance(val, str) and val.strip():
+            return {"author": "Criador", "datetime": "", "text": val.strip()}
+        if isinstance(val, dict):
+            text = (val.get("text") or val.get("message") or val.get("body") or "").strip()
+            if text:
+                author = (val.get("author") or val.get("name") or val.get("by") or "Criador").strip()
+                dt = str(val.get("at") or val.get("datetime") or val.get("date") or val.get("time") or "").strip()
+                return {"author": author, "datetime": dt, "text": text}
+    return None
+
+
+def fetch_pinned_from_html() -> dict | None:
+    query = urllib.parse.urlencode({"ts": int(time.time() // 60)})
+    req = urllib.request.Request(
+        f"{SITE_URL}?{query}",
+        headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html_body = resp.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        print(f"AVISO ao ler HTML do quadro fixado: {type(exc).__name__}", file=sys.stderr)
+        return None
+
+    parser = _PinnedHTMLParser()
+    parser.feed(html_body)
+    text = "".join(parser.text_parts).strip()
+    if not text:
+        return None
+    author = "".join(parser.author_parts).strip() or "Criador"
+    return {"author": author, "datetime": parser.datetime_val, "text": text}
+
+
+def get_pinned_message(tracker_data: dict) -> dict | None:
+    pinned = extract_pinned_from_tracker(tracker_data)
+    if pinned:
+        return pinned
+    return fetch_pinned_from_html()
+
+
+# ---------- Tradução PT-BR ----------
 
 def _translate_mymemory(text: str) -> str | None:
     params = urllib.parse.urlencode({"q": text[:500], "langpair": "en|pt-BR"})
@@ -265,26 +393,31 @@ def _translate_google_gtx(text: str) -> str | None:
     return translated or None
 
 
-def translate_ptbr(text: str) -> str:
-    clean = (text or "").strip()
-    if not clean:
-        return ""
-
+def _translate_single(text: str) -> str:
     providers = (
         ("MyMemory", _translate_mymemory),
         ("Google-clients5", _translate_google_clients5),
         ("Google-gtx", _translate_google_gtx),
     )
-
     for name, fn in providers:
         try:
-            result = fn(clean)
+            result = fn(text)
             if result:
                 return result
         except Exception as exc:
             print(f"AVISO tradução ({name}): {type(exc).__name__}", file=sys.stderr)
+    return text
 
-    return clean
+
+def translate_ptbr(text: str) -> str:
+    clean = (text or "").strip()
+    if not clean:
+        return ""
+    # Preserva quebras de parágrafo (como no quadro fixado)
+    paragraphs = [p.strip() for p in clean.split("\n\n") if p.strip()]
+    if len(paragraphs) > 1:
+        return "\n\n".join(_translate_single(p) for p in paragraphs)
+    return _translate_single(clean)
 
 
 def format_bullet_list(items: list[str], prefix: str, max_len: int = 950) -> str:
@@ -329,8 +462,8 @@ def _build_gradient_strip(width: int, height: int):
     stops = [
         (0.00, (122, 92, 255)),   # #7a5cff roxo
         (0.25, (186, 82, 224)),   # lilás
-        (0.55, (255, 46, 126)),   # #ff2e7e rosa
-        (0.80, (255, 98, 102)),   # coral
+        (0.50, (255, 46, 126)),   # #ff2e7e rosa
+        (0.75, (255, 98, 102)),   # coral
         (1.00, (255, 138, 61)),   # #ff8a3d laranja
     ]
     strip = Image.new("RGB", (width, height))
@@ -368,7 +501,6 @@ def _draw_progress_bar(
     if fill_w > 0:
         mask = Image.new("L", (width, height), 0)
         mdraw = ImageDraw.Draw(mask)
-        # Trilha externa arredondada + preenchimento arredondado na ponta direita
         mdraw.rounded_rectangle([0, 0, fill_w, height], radius=min(radius, max(1, fill_w // 2)), fill=255)
         track_mask = Image.new("L", (width, height), 0)
         ImageDraw.Draw(track_mask).rounded_rectangle([0, 0, width, height], radius=radius, fill=255)
@@ -376,7 +508,7 @@ def _draw_progress_bar(
         bar_grad = grad_strip.resize((width, height)) if grad_strip.size != (width, height) else grad_strip
         img.paste(bar_grad, (x0, y0), combined)
 
-    # Divisórias verticais em 25%, 40%, 55%, 70%, 85%
+    # Divisórias verticais em 10%, 20%, 30%, 40%, 50%
     for _, _, at in MILESTONES[1:-1]:
         dx = x0 + int(round((at / 100.0) * width))
         draw.rectangle([dx - 1, y0, dx + 1, y0 + height], fill=bg_color)
@@ -401,7 +533,7 @@ def _draw_milestone_label(draw, x: int, y: int, label: str, state: str, font, al
     bbox = draw.textbbox((0, 0), label, font=font)
     tw = bbox[2] - bbox[0]
     th = bbox[3] - bbox[1]
-    dot_gap = 12
+    dot_gap = 11
     total_w = dot_gap + tw
 
     if align == "left":
@@ -438,27 +570,18 @@ def _project_milestone_items(leader: dict | None) -> list[tuple[int, str, str]]:
             return "partial"
         return "unreached"
 
-    fps_raw = gta.get("fps")
-    try:
-        fps_num = float(fps_raw) if fps_raw else 0.0
-    except (TypeError, ValueError):
-        fps_num = 0.0
-    fps_label = f"{round(fps_num)} FPS" if fps_num > 0 else "30 FPS"
-    fps_state = st(min(1.0, fps_num / 30.0))
-
-    stab_key = gta.get("stability") or "unknown"
-    stab_val = STABILITY.get(stab_key, 0.0)
-    stab_label = STABILITY_BAR_PT.get(stab_key, "Estável")
-    stab_state = st(stab_val)
+    tracks = leader.get("tracks") or {}
+    quality = sum(weight * tracks.get(key, 0.0) for key, _, weight in TRACKS)
+    complete_state = "reached" if leader["reached"] == "complete" else ("partial" if leader.get("playable") and quality > 0 else "unreached")
 
     return [
         (0, "Preparação", "reached" if past_gw else st(gw)),
-        (25, "Exe rodando", st(ladder_value(gta.get("loads")))),
-        (40, "Primeiro frame", st(ladder_value(gta.get("boots")))),
-        (55, "Menu principal", st(ladder_value(gta.get("menu")))),
-        (70, "Dentro do jogo", st(ladder_value(gta.get("ingame")))),
-        (85, fps_label, fps_state),
-        (100, stab_label, stab_state),
+        (10, "Exe rodando", st(ladder_value(gta.get("loads")))),
+        (20, "Primeiro frame", st(ladder_value(gta.get("boots")))),
+        (30, "Menu principal", st(ladder_value(gta.get("menu")))),
+        (40, "No mundo", st(ladder_value(gta.get("world")))),
+        (50, "Jogável", st(ladder_value(gta.get("playable")))),
+        (100, "Completo", complete_state),
     ]
 
 
@@ -466,18 +589,19 @@ def generate_progress_gif(ov: dict) -> bytes | None:
     if Image is None:
         return None
 
-    W, H = 1000, 355
+    W, H = 1120, 415
     BG = (15, 16, 22)
-    BAR_X, BAR_W = 55, 890
+    BAR_X, BAR_W = 55, 1010
     BAR1_Y, BAR1_H = 112, 24
     BAR2_Y, BAR2_H = 266, 20
 
     font_header = _load_font(13, bold=True)
     font_score = _load_font(18, bold=True)
-    font_pct = _load_font(12, bold=True)
-    font_label = _load_font(12, bold=True)
+    font_pct = _load_font(11, bold=True)
+    font_label = _load_font(11, bold=True)
     font_pill = _load_font(12, bold=True)
     font_init = _load_font(12, bold=True)
+    font_track = _load_font(11, bold=False)
 
     grad1 = _build_gradient_strip(BAR_W, BAR1_H)
     grad2 = _build_gradient_strip(BAR_W, BAR2_H)
@@ -489,7 +613,7 @@ def generate_progress_gif(ov: dict) -> bytes | None:
     furthest_idx = ov.get("furthest_idx", 0)
     proj_items = _project_milestone_items(leader)
 
-    # Posicionamento sem sobreposição dos marcadores do Top 6 na barra geral
+    # Posicionamento sem sobreposição dos marcadores do Top 6
     top_ranked = ov.get("ranked", [])[:6]
     markers = []
     for r in top_ranked:
@@ -511,7 +635,6 @@ def generate_progress_gif(ov: dict) -> bytes | None:
             for m in markers:
                 m["ax"] -= overflow
 
-    # Base estática (títulos, marcadores do top 6, rótulos de ambas as barras)
     base = Image.new("RGB", (W, H), BG)
     bdraw = ImageDraw.Draw(base)
 
@@ -530,11 +653,10 @@ def generate_progress_gif(ov: dict) -> bytes | None:
         bdraw.line([(ax, circle_y + circle_r), (tx, BAR1_Y - 1)], fill=line_col, width=2)
         bdraw.ellipse([tx - 3, BAR1_Y - 4, tx + 3, BAR1_Y + 2], fill=line_col)
 
-        fill_c = (28, 30, 42)
         outline_c = (255, 46, 126) if is_leader else (85, 92, 114)
         bdraw.ellipse(
             [ax - circle_r, circle_y - circle_r, ax + circle_r, circle_y + circle_r],
-            fill=fill_c,
+            fill=(28, 30, 42),
             outline=outline_c,
             width=2,
         )
@@ -570,17 +692,49 @@ def generate_progress_gif(ov: dict) -> bytes | None:
 
     # Cabeçalho Seção 2 (Projeto Líder)
     bdraw.text((BAR_X, 228), f"PROJETO LÍDER · {leader_name.upper()}", font=font_header, fill=(142, 148, 168))
-    sub_right = f"{leader_label}"
-    sb = bdraw.textbbox((0, 0), sub_right, font=font_header)
-    bdraw.text((BAR_X + BAR_W - (sb[2] - sb[0]), 228), sub_right, font=font_header, fill=(198, 204, 218))
+    sb = bdraw.textbbox((0, 0), leader_label, font=font_header)
+    bdraw.text((BAR_X + BAR_W - (sb[2] - sb[0]), 228), leader_label, font=font_header, fill=(198, 204, 218))
 
     # Rótulos da Barra do Projeto
     for at, label, st in proj_items:
         mx = BAR_X + int(round((at / 100.0) * BAR_W))
         align = "left" if at == 0 else ("right" if at == 100 else "center")
-        _draw_milestone_label(bdraw, mx, BAR2_Y + BAR2_H + 16, label, st, font_label, align)
+        _draw_milestone_label(bdraw, mx, BAR2_Y + BAR2_H + 14, label, st, font_label, align)
 
-    # Gera quadros da animação (ease-out cúbico de 0% até target_score)
+    # 4 trilhas de qualidade (50% -> 100%) abaixo da barra do projeto
+    if leader:
+        gta = leader["effort"].get("gta") or {}
+        tracks = leader.get("tracks") or {}
+        fps_val = gta.get("fps")
+        fps_str = f"{round(float(fps_val))} FPS" if fps_val else "0 FPS"
+        stab_str = STABILITY_LABEL_PT.get(gta.get("stability") or "unknown", "Desconhecida")
+
+        cards = [
+            ("História (35%)", track_step_label(STORY_STEPS_PT, tracks.get("story", 0)), tracks.get("story", 0)),
+            ("Render (25%)", track_step_label(RENDER_STEPS_PT, tracks.get("render", 0)), tracks.get("render", 0)),
+            ("Desempenho (20%)", fps_str, tracks.get("perf", 0)),
+            ("Estabilidade (20%)", stab_str, tracks.get("stability", 0)),
+        ]
+        card_gap = 14
+        card_w = (BAR_W - card_gap * 3) // 4
+        card_y = 334
+        card_h = 62
+        for i, (cname, cval, cfrac) in enumerate(cards):
+            cx = BAR_X + i * (card_w + card_gap)
+            bdraw.rounded_rectangle([cx, card_y, cx + card_w, card_y + card_h], radius=8, fill=(23, 25, 35), outline=(38, 42, 58), width=1)
+            bdraw.text((cx + 12, card_y + 9), cname, font=font_pct, fill=(142, 148, 168))
+            pct_s = f"{round(cfrac * 100)}%"
+            pb = bdraw.textbbox((0, 0), pct_s, font=font_pct)
+            bdraw.text((cx + card_w - 12 - (pb[2] - pb[0]), card_y + 9), pct_s, font=font_pct, fill=(255, 46, 126) if cfrac > 0 else (112, 118, 138))
+            bdraw.text((cx + 12, card_y + 27), cval[:28], font=font_track, fill=(235, 238, 245))
+            # Mini-barra dentro do card
+            mx0, my0, mw, mh = cx + 12, card_y + 48, card_w - 24, 5
+            bdraw.rounded_rectangle([mx0, my0, mx0 + mw, my0 + mh], radius=2, fill=(38, 42, 58))
+            fw = int(round(mw * clamp01(cfrac)))
+            if fw > 0:
+                bdraw.rounded_rectangle([mx0, my0, mx0 + fw, my0 + mh], radius=2, fill=(255, 46, 126))
+
+    # Quadros da animação
     total_steps = 18
     frames = []
     durations = []
@@ -593,214 +747,8 @@ def generate_progress_gif(ov: dict) -> bytes | None:
         frame = base.copy()
         fdraw = ImageDraw.Draw(frame)
 
-        # Porcentagem animada no canto superior direito
-        score_txt = f"{val:.1f}%" if (target_score % 1 and step == total_steps) else f"{round(val)}%"
-        if step == total_steps:
-            score_txt = f"{target_score:g}%"
+        score_txt = f"{target_score:g}%" if step == total_steps else f"{round(val)}%"
         stb = fdraw.textbbox((0, 0), score_txt, font=font_score)
         fdraw.text((BAR_X + BAR_W - (stb[2] - stb[0]), 14), score_txt, font=font_score, fill=(255, 46, 126))
 
-        _draw_progress_bar(frame, fdraw, grad1, BAR_X, BAR1_Y, BAR_W, BAR1_H, val, BG)
-        _draw_progress_bar(frame, fdraw, grad2, BAR_X, BAR2_Y, BAR_W, BAR2_H, val, BG)
-
-        frames.append(frame.convert("P", palette=Image.ADAPTIVE, colors=128))
-        durations.append(6000 if step == total_steps else 55)
-
-    buf = io.BytesIO()
-    frames[0].save(
-        buf,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=durations,
-        loop=0,
-        optimize=True,
-    )
-    return buf.getvalue()
-
-
-# ---------- Envio para o Discord (JSON ou Multipart com GIF) ----------
-
-def _build_multipart(payload: dict, file_bytes: bytes, filename: str) -> tuple[bytes, str]:
-    boundary = f"----PortwatchBoundary{uuid.uuid4().hex}"
-    parts = [
-        f"--{boundary}\r\n".encode("utf-8"),
-        b'Content-Disposition: form-data; name="payload_json"\r\n',
-        b"Content-Type: application/json; charset=utf-8\r\n\r\n",
-        json.dumps(payload).encode("utf-8"),
-        b"\r\n",
-        f"--{boundary}\r\n".encode("utf-8"),
-        f'Content-Disposition: form-data; name="files[0]"; filename="{filename}"\r\n'.encode("utf-8"),
-        b"Content-Type: image/gif\r\n\r\n",
-        file_bytes,
-        b"\r\n",
-        f"--{boundary}--\r\n".encode("utf-8"),
-    ]
-    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
-
-
-def send_discord_alert(
-    webhook_url: str,
-    title: str,
-    ov: dict,
-    previous_value: float | None,
-    color: int,
-) -> None:
-    current_value = ov["score"]
-    leader = ov["leader"]
-    effort = leader["effort"] if leader else {}
-    leader_name = effort.get("name", "Desconhecido")
-    reached_label = leader["reached_label"] if leader else "-"
-
-    formatted_now = f"{current_value:g}%"
-    if previous_value is not None and current_value > previous_value:
-        progress_str = f"{previous_value:g}% → **{formatted_now}** (+{current_value - previous_value:g}%)"
-    else:
-        progress_str = f"**{formatted_now}**"
-
-    summary_pt = translate_ptbr(effort.get("summary", ""))
-    description = f"O progresso geral chegou a {progress_str}."
-    if summary_pt:
-        description += f"\n\n{summary_pt}"
-
-    fields = [
-        {"name": "Projeto líder", "value": leader_name, "inline": True},
-        {"name": "Marco atual", "value": reached_label, "inline": True},
-    ]
-
-    gta = effort.get("gta") or {}
-    if gta.get("fps"):
-        fields.append({"name": "Desempenho", "value": f"{round(float(gta['fps']))} FPS", "inline": True})
-    elif gta.get("stability") and gta["stability"] != "unknown":
-        stab_pt = STABILITY_LABEL_PT.get(gta["stability"], gta["stability"])
-        fields.append({"name": "Estabilidade", "value": stab_pt, "inline": True})
-
-    works_text = format_bullet_list(effort.get("highlights") or [], "✅")
-    if works_text:
-        fields.append({"name": "O que funciona", "value": works_text, "inline": False})
-
-    blockers_text = format_bullet_list(effort.get("blockers") or [], "⛔")
-    if blockers_text:
-        fields.append({"name": "O que está travando", "value": blockers_text, "inline": False})
-
-    gif_bytes = None
-    try:
-        gif_bytes = generate_progress_gif(ov)
-    except Exception as exc:
-        print(f"AVISO ao gerar GIF de progresso: {type(exc).__name__}", file=sys.stderr)
-
-    embed = {
-        "title": title,
-        "description": description[:4000],
-        "url": DISPLAY_URL,
-        "color": color,
-        "fields": fields,
-    }
-    if gif_bytes:
-        embed["image"] = {"url": "attachment://progresso.gif"}
-    if effort.get("assessedAt"):
-        embed["footer"] = {"text": f"Revisado em {effort['assessedAt']}"}
-
-    payload = {
-        "username": "Portwatch VI Monitor",
-        "embeds": [embed],
-    }
-
-    if gif_bytes:
-        body, content_type = _build_multipart(payload, gif_bytes, "progresso.gif")
-    else:
-        body = json.dumps(payload).encode("utf-8")
-        content_type = "application/json"
-
-    req = urllib.request.Request(
-        webhook_url,
-        data=body,
-        headers={
-            "Content-Type": content_type,
-            "User-Agent": USER_AGENT,
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            if not (200 <= resp.status < 300):
-                raise RuntimeError(f"Discord retornou status inesperado: HTTP {resp.status}.")
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Falha ao enviar alerta ao Discord (HTTP {exc.code}).") from None
-    except urllib.error.URLError:
-        raise RuntimeError("Falha de conexão ao enviar alerta ao Discord.") from None
-    except OSError:
-        raise RuntimeError("Erro de rede/timeout ao enviar alerta ao Discord.") from None
-
-
-def main() -> None:
-    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-    if not webhook_url:
-        print("ERRO: variável DISCORD_WEBHOOK_URL não configurada.", file=sys.stderr)
-        sys.exit(1)
-
-    test_mode = os.environ.get("TEST_NOTIFICATION", "").lower() == "true"
-    state = load_state()
-
-    try:
-        data = fetch_tracker()
-        ov = compute_overall(data.get("efforts", []))
-        current = ov["score"]
-        leader = ov["leader"]
-        leader_id = leader["effort"].get("id") if leader else None
-        leader_name = leader["effort"].get("name") if leader else "Nenhum"
-
-        print(f"Score atual (#ov-score): {current:g}% | Líder: {leader_name}")
-
-        if test_mode:
-            send_discord_alert(
-                webhook_url,
-                f"Teste Portwatch VI — {current:g}% ({leader_name})",
-                ov,
-                state["last_score"],
-                0x3498DB,
-            )
-            print("Notificação de teste enviada no Discord (state.json não alterado).")
-            return
-
-        last_score = state["last_score"]
-
-        if last_score is None:
-            state["last_score"] = current
-            state["last_leader"] = leader_id
-            state["notified_90"] = current >= 90.0
-            state["notified_100"] = current >= 100.0
-            save_state(state)
-            print(f"Estado inicial salvo em {current:g}% ({leader_name}).")
-            return
-
-        if current <= last_score:
-            print(f"Sem avanço (atual: {current:g}% | último registrado: {last_score:g}%).")
-            return
-
-        if current >= 100.0 and not state["notified_100"]:
-            title = f"🎉 MARCO 100%! {leader_name} atingiu {current:g}%"
-            color = 0x2ECC71
-            state["notified_100"] = True
-            state["notified_90"] = True
-        elif current >= 90.0 and not state["notified_90"]:
-            title = f"🔥 MARCO 90%! {leader_name} atingiu {current:g}%"
-            color = 0xF1C40F
-            state["notified_90"] = True
-        else:
-            title = f"📈 Novo avanço no Portwatch VI: {last_score:g}% → {current:g}%"
-            color = 0xFF2E7E
-
-        send_discord_alert(webhook_url, title, ov, last_score, color)
-        state["last_score"] = current
-        state["last_leader"] = leader_id
-        save_state(state)
-        print(f"Alerta de avanço enviado ({last_score:g}% -> {current:g}%).")
-    except RuntimeError as exc:
-        print(f"ERRO: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+        _draw_progress_bar(frame, fdraw, grad1, BAR_X, BAR1
