@@ -21,6 +21,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install Pillow and fonts
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-pil fonts-dejavu-core
+
       - name: Run monitor script
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
