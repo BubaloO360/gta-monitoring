@@ -122,6 +122,14 @@ def score_effort(effort: dict) -> dict:
         if fps >= 1.0 and stab >= 1.0:
             reached = "stable"
 
+    manual_score = effort.get("manualScore")
+    if (
+        isinstance(manual_score, (int, float))
+        and not isinstance(manual_score, bool)
+        and math.isfinite(manual_score)
+    ):
+        score = min(100.0, max(0.0, float(manual_score)))
+
     return {
         "score": js_round_1(score),
         "reached": reached,
