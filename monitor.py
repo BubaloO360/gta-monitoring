@@ -2,10 +2,12 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import requests
-from bs4 import BeautifulSoup
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 TARGET_URL = "https://portwatch-vi.xyz/"
 DISPLAY_URL = "https://portwatch-vi.xyz/#top"
@@ -23,43 +25,62 @@ def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
 
-def fetch_html(url: str) -> str:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        )
-    }
-    resp = requests.get(url, headers=headers, timeout=20)
-    resp.raise_for_status()
-    return resp.text
-
-
-def extract_score(html: str) -> float | None:
-    soup = BeautifulSoup(html, "html.parser")
-    el = soup.select_one(CSS_SELECTOR)
-
-    if not el:
-        print(f"AVISO: elemento '{CSS_SELECTOR}' não encontrado no HTML estático.", file=sys.stderr)
-        return None
-
-    raw_text = el.get_text(strip=True)
-    match = re.search(r"\d+(?:[.,]\d+)?", raw_text)
+def parse_score(raw_text: str) -> float | None:
+    match = re.search(r"\d+(?:[.,]\d+)?", raw_text.strip())
     if not match:
-        print(
-            f"AVISO: elemento '{CSS_SELECTOR}' encontrado, mas sem número válido "
-            f"(conteúdo lido: {raw_text!r}). Provavelmente preenchido via JavaScript.",
-            file=sys.stderr,
-        )
         return None
-
     value = float(match.group(0).replace(",", "."))
-    if not (0.0 <= value <= 100.0):
-        print(f"AVISO: valor fora da faixa esperada (0-100): {value}", file=sys.stderr)
-        return None
+    return value if 0.0 <= value <= 100.0 else None
 
-    return value
+
+def fetch_rendered_score(url: str) -> float | None:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            )
+        )
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+        locator = page.locator(CSS_SELECTOR).first
+        locator.wait_for(state="attached", timeout=15000)
+        locator.scroll_into_view_if_needed()
+
+        # Aguarda o JavaScript atualizar o valor inicial (0) para o valor real
+        try:
+            page.wait_for_function(
+                """(selector) => {
+                    const el = document.querySelector(selector);
+                    if (!el) return false;
+                    const val = parseFloat(el.textContent.replace(',', '.').trim());
+                    return !isNaN(val) && val > 0;
+                }""",
+                arg=CSS_SELECTOR,
+                timeout=15000,
+            )
+        except PlaywrightTimeoutError:
+            pass
+
+        # Aguarda o número estabilizar (evita capturar meio da animação de contagem)
+        last_val = None
+        stable_reads = 0
+        for _ in range(14):  # até 7 segundos
+            raw = locator.inner_text()
+            current_val = parse_score(raw)
+            if current_val is not None and current_val == last_val:
+                stable_reads += 1
+                if stable_reads >= 3:
+                    break
+            else:
+                stable_reads = 0
+                last_val = current_val
+            time.sleep(0.5)
+
+        browser.close()
+        return last_val
 
 
 def send_discord_alert(webhook_url: str, milestone: int, current_value: float) -> None:
@@ -95,10 +116,9 @@ def main() -> None:
         print("Marcos de 90% e 100% já notificados. Encerrando.")
         return
 
-    html = fetch_html(TARGET_URL)
-    current = extract_score(html)
-
+    current = fetch_rendered_score(TARGET_URL)
     if current is None:
+        print(f"ERRO: não foi possível ler um valor válido em '{CSS_SELECTOR}'.", file=sys.stderr)
         sys.exit(1)
 
     print(f"Valor atual em {CSS_SELECTOR}: {current:g}%")
