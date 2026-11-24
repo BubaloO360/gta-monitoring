@@ -21,19 +21,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        run: pip install requests
-
       - name: Run monitor script
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           TEST_NOTIFICATION: ${{ inputs.test_notification }}
-        run: python monitor.py
+        run: python3 monitor.py
 
       - name: Commit state changes
         run: |
