@@ -8,7 +8,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from html.parser import HTMLParser
 from pathlib import Path
 
 try:
@@ -18,6 +17,7 @@ except ImportError:
 
 SITE_URL = "https://portwatch-vi.xyz/"
 TRACKER_URL = "https://portwatch-vi.xyz/data/tracker.json"
+PINNED_URL = "https://portwatch-vi.xyz/data/pinned.json"
 DISPLAY_URL = "https://portwatch-vi.xyz/#top"
 STATE_FILE = Path("state.json")
 
@@ -223,10 +223,10 @@ def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
 
-def fetch_tracker() -> dict:
+def _fetch_json(url: str, label: str, required: bool = True) -> dict | None:
     query = urllib.parse.urlencode({"ts": int(time.time() // 60)})
     req = urllib.request.Request(
-        f"{TRACKER_URL}?{query}",
+        f"{url}?{query}",
         headers={
             "User-Agent": USER_AGENT,
             "Accept": "application/json, */*",
@@ -238,105 +238,38 @@ def fetch_tracker() -> dict:
         with urllib.request.urlopen(req, timeout=20) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Erro HTTP {exc.code} ao consultar tracker.json.") from None
+        if not required:
+            print(f"AVISO: HTTP {exc.code} ao consultar {label}.", file=sys.stderr)
+            return None
+        raise RuntimeError(f"Erro HTTP {exc.code} ao consultar {label}.") from None
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"Erro de rede ao consultar tracker.json: {exc.reason}") from None
+        if not required:
+            print(f"AVISO: erro de rede ao consultar {label}.", file=sys.stderr)
+            return None
+        raise RuntimeError(f"Erro de rede ao consultar {label}: {exc.reason}") from None
     except json.JSONDecodeError:
-        raise RuntimeError("Resposta inválida (JSON corrompido) em tracker.json.") from None
+        if not required:
+            print(f"AVISO: JSON inválido em {label}.", file=sys.stderr)
+            return None
+        raise RuntimeError(f"Resposta inválida (JSON corrompido) em {label}.") from None
 
 
-# ---------- Leitura do quadro fixado (#pinned) ----------
-
-class _PinnedHTMLParser(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.in_aside = False
-        self.aside_depth = 0
-        self.capture = None
-        self.author_parts: list[str] = []
-        self.text_parts: list[str] = []
-        self.datetime_val = ""
-
-    def handle_starttag(self, tag, attrs):
-        attr_map = dict(attrs)
-        classes = set((attr_map.get("class") or "").split())
-
-        if not self.in_aside:
-            if tag == "aside" and (attr_map.get("id") == "pinned" or "pinned" in classes):
-                self.in_aside = True
-                self.aside_depth = 1
-            return
-
-        self.aside_depth += 1
-        if "pin-name" in classes:
-            self.capture = "author"
-        elif "pin-text" in classes:
-            self.capture = "text"
-        elif "pin-time" in classes and attr_map.get("datetime"):
-            self.datetime_val = attr_map["datetime"].strip()
-        elif tag == "br" and self.capture == "text":
-            self.text_parts.append("\n")
-
-    def handle_endtag(self, tag):
-        if not self.in_aside:
-            return
-        if self.capture in ("author", "text") and tag in ("b", "p", "span", "div"):
-            self.capture = None
-        self.aside_depth -= 1
-        if self.aside_depth <= 0:
-            self.in_aside = False
-
-    def handle_data(self, data):
-        if self.capture == "author":
-            self.author_parts.append(data)
-        elif self.capture == "text":
-            self.text_parts.append(data)
+def fetch_tracker() -> dict:
+    return _fetch_json(TRACKER_URL, "tracker.json", required=True)
 
 
-def extract_pinned_from_tracker(data: dict) -> dict | None:
-    for key in ("pinned", "pin", "pinnedMessage", "notice", "announcement"):
-        val = data.get(key)
-        if not val:
-            continue
-        if isinstance(val, str) and val.strip():
-            return {"author": "Criador", "datetime": "", "text": val.strip()}
-        if isinstance(val, dict):
-            text = (val.get("text") or val.get("message") or val.get("body") or "").strip()
-            if text:
-                author = (val.get("author") or val.get("name") or val.get("by") or "Criador").strip()
-                dt = str(val.get("at") or val.get("datetime") or val.get("date") or val.get("time") or "").strip()
-                return {"author": author, "datetime": dt, "text": text}
-    return None
-
-
-def fetch_pinned_from_html() -> dict | None:
-    query = urllib.parse.urlencode({"ts": int(time.time() // 60)})
-    req = urllib.request.Request(
-        f"{SITE_URL}?{query}",
-        headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*"},
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            html_body = resp.read().decode("utf-8", errors="replace")
-    except Exception as exc:
-        print(f"AVISO ao ler HTML do quadro fixado: {type(exc).__name__}", file=sys.stderr)
+def fetch_pinned() -> dict | None:
+    data = _fetch_json(PINNED_URL, "pinned.json", required=False)
+    if not isinstance(data, dict) or not data.get("show"):
         return None
-
-    parser = _PinnedHTMLParser()
-    parser.feed(html_body)
-    text = "".join(parser.text_parts).strip()
+    text = (data.get("text") or "").strip()
     if not text:
         return None
-    author = "".join(parser.author_parts).strip() or "Criador"
-    return {"author": author, "datetime": parser.datetime_val, "text": text}
-
-
-def get_pinned_message(tracker_data: dict) -> dict | None:
-    pinned = extract_pinned_from_tracker(tracker_data)
-    if pinned:
-        return pinned
-    return fetch_pinned_from_html()
+    return {
+        "author": (data.get("name") or "Criador").strip(),
+        "datetime": str(data.get("updated") or "").strip(),
+        "text": text,
+    }
 
 
 # ---------- Tradução PT-BR ----------
@@ -413,7 +346,6 @@ def translate_ptbr(text: str) -> str:
     clean = (text or "").strip()
     if not clean:
         return ""
-    # Preserva quebras de parágrafo (como no quadro fixado)
     paragraphs = [p.strip() for p in clean.split("\n\n") if p.strip()]
     if len(paragraphs) > 1:
         return "\n\n".join(_translate_single(p) for p in paragraphs)
@@ -460,11 +392,11 @@ def _lerp_color(c1: tuple[int, int, int], c2: tuple[int, int, int], t: float) ->
 
 def _build_gradient_strip(width: int, height: int):
     stops = [
-        (0.00, (122, 92, 255)),   # #7a5cff roxo
+        (0.00, (122, 92, 255)),   # roxo
         (0.25, (186, 82, 224)),   # lilás
-        (0.50, (255, 46, 126)),   # #ff2e7e rosa
+        (0.50, (255, 46, 126)),   # rosa
         (0.75, (255, 98, 102)),   # coral
-        (1.00, (255, 138, 61)),   # #ff8a3d laranja
+        (1.00, (255, 138, 61)),   # laranja
     ]
     strip = Image.new("RGB", (width, height))
     draw = ImageDraw.Draw(strip)
@@ -508,7 +440,6 @@ def _draw_progress_bar(
         bar_grad = grad_strip.resize((width, height)) if grad_strip.size != (width, height) else grad_strip
         img.paste(bar_grad, (x0, y0), combined)
 
-    # Divisórias verticais em 10%, 20%, 30%, 40%, 50%
     for _, _, at in MILESTONES[1:-1]:
         dx = x0 + int(round((at / 100.0) * width))
         draw.rectangle([dx - 1, y0, dx + 1, y0 + height], fill=bg_color)
@@ -572,7 +503,11 @@ def _project_milestone_items(leader: dict | None) -> list[tuple[int, str, str]]:
 
     tracks = leader.get("tracks") or {}
     quality = sum(weight * tracks.get(key, 0.0) for key, _, weight in TRACKS)
-    complete_state = "reached" if leader["reached"] == "complete" else ("partial" if leader.get("playable") and quality > 0 else "unreached")
+    complete_state = (
+        "reached"
+        if leader["reached"] == "complete"
+        else ("partial" if leader.get("playable") and quality > 0 else "unreached")
+    )
 
     return [
         (0, "Preparação", "reached" if past_gw else st(gw)),
@@ -589,7 +524,7 @@ def generate_progress_gif(ov: dict) -> bytes | None:
     if Image is None:
         return None
 
-    W, H = 1120, 415
+    W, H = 1120, 445
     BG = (15, 16, 22)
     BAR_X, BAR_W = 55, 1010
     BAR1_Y, BAR1_H = 112, 24
@@ -598,7 +533,7 @@ def generate_progress_gif(ov: dict) -> bytes | None:
     font_header = _load_font(13, bold=True)
     font_score = _load_font(18, bold=True)
     font_pct = _load_font(11, bold=True)
-    font_label = _load_font(11, bold=True)
+    font_label = _load_font(12, bold=True)
     font_pill = _load_font(12, bold=True)
     font_init = _load_font(12, bold=True)
     font_track = _load_font(11, bold=False)
@@ -640,7 +575,7 @@ def generate_progress_gif(ov: dict) -> bytes | None:
 
     # Cabeçalho Seção 1
     bdraw.text((BAR_X, 18), "PROGRESSO GERAL", font=font_header, fill=(142, 148, 168))
-    bdraw.line([(BAR_X, 208), (BAR_X + BAR_W, 208)], fill=(32, 36, 50), width=1)
+    bdraw.line([(BAR_X, 218), (BAR_X + BAR_W, 218)], fill=(32, 36, 50), width=1)
 
     # Marcadores do Top 6 acima da barra geral
     circle_y = 74
@@ -674,10 +609,16 @@ def generate_progress_gif(ov: dict) -> bytes | None:
             pw, ph = pb[2] - pb[0] + 18, pb[3] - pb[1] + 10
             px = int(max(BAR_X, min(BAR_X + BAR_W - pw, ax - pw / 2)))
             py = 36
-            bdraw.rounded_rectangle([px, py, px + pw, py + ph], radius=10, fill=(26, 29, 42), outline=(66, 72, 92), width=1)
+            bdraw.rounded_rectangle(
+                [px, py, px + pw, py + ph],
+                radius=10,
+                fill=(26, 29, 42),
+                outline=(66, 72, 92),
+                width=1,
+            )
             bdraw.text((px + 9, py + 4), pill_text, font=font_pill, fill=(242, 244, 248))
 
-    # Porcentagens e rótulos da Barra Geral
+    # Porcentagens + rótulos intercalados em 2 alturas (Barra Geral)
     for idx, (_, label, at) in enumerate(MILESTONES):
         mx = BAR_X + int(round((at / 100.0) * BAR_W))
         align = "left" if at == 0 else ("right" if at == 100 else "center")
@@ -687,21 +628,30 @@ def generate_progress_gif(ov: dict) -> bytes | None:
         pw = pb[2] - pb[0]
         px = mx if align == "left" else (mx - pw if align == "right" else int(mx - pw / 2))
         pct_col = (255, 46, 126) if st == "reached" else (112, 118, 138)
-        bdraw.text((px, BAR1_Y + BAR1_H + 12), pct_text, font=font_pct, fill=pct_col)
-        _draw_milestone_label(bdraw, mx, BAR1_Y + BAR1_H + 30, label, st, font_label, align)
+        bdraw.text((px, BAR1_Y + BAR1_H + 10), pct_text, font=font_pct, fill=pct_col)
+
+        is_lower_row = idx % 2 == 1
+        label_y = BAR1_Y + BAR1_H + (50 if is_lower_row else 28)
+        if is_lower_row:
+            bdraw.line([(mx, BAR1_Y + BAR1_H + 25), (mx, label_y - 3)], fill=(45, 50, 68), width=1)
+        _draw_milestone_label(bdraw, mx, label_y, label, st, font_label, align)
 
     # Cabeçalho Seção 2 (Projeto Líder)
-    bdraw.text((BAR_X, 228), f"PROJETO LÍDER · {leader_name.upper()}", font=font_header, fill=(142, 148, 168))
+    bdraw.text((BAR_X, 236), f"PROJETO LÍDER · {leader_name.upper()}", font=font_header, fill=(142, 148, 168))
     sb = bdraw.textbbox((0, 0), leader_label, font=font_header)
-    bdraw.text((BAR_X + BAR_W - (sb[2] - sb[0]), 228), leader_label, font=font_header, fill=(198, 204, 218))
+    bdraw.text((BAR_X + BAR_W - (sb[2] - sb[0]), 236), leader_label, font=font_header, fill=(198, 204, 218))
 
-    # Rótulos da Barra do Projeto
-    for at, label, st in proj_items:
+    # Rótulos intercalados em 2 alturas (Barra do Projeto)
+    for idx, (at, label, st) in enumerate(proj_items):
         mx = BAR_X + int(round((at / 100.0) * BAR_W))
         align = "left" if at == 0 else ("right" if at == 100 else "center")
-        _draw_milestone_label(bdraw, mx, BAR2_Y + BAR2_H + 14, label, st, font_label, align)
+        is_lower_row = idx % 2 == 1
+        label_y = BAR2_Y + BAR2_H + (34 if is_lower_row else 12)
+        if is_lower_row:
+            bdraw.line([(mx, BAR2_Y + BAR2_H + 3), (mx, label_y - 3)], fill=(45, 50, 68), width=1)
+        _draw_milestone_label(bdraw, mx, label_y, label, st, font_label, align)
 
-    # 4 trilhas de qualidade (50% -> 100%) abaixo da barra do projeto
+    # 4 trilhas de qualidade (50% -> 100%)
     if leader:
         gta = leader["effort"].get("gta") or {}
         tracks = leader.get("tracks") or {}
@@ -717,17 +667,27 @@ def generate_progress_gif(ov: dict) -> bytes | None:
         ]
         card_gap = 14
         card_w = (BAR_W - card_gap * 3) // 4
-        card_y = 334
+        card_y = 362
         card_h = 62
         for i, (cname, cval, cfrac) in enumerate(cards):
             cx = BAR_X + i * (card_w + card_gap)
-            bdraw.rounded_rectangle([cx, card_y, cx + card_w, card_y + card_h], radius=8, fill=(23, 25, 35), outline=(38, 42, 58), width=1)
+            bdraw.rounded_rectangle(
+                [cx, card_y, cx + card_w, card_y + card_h],
+                radius=8,
+                fill=(23, 25, 35),
+                outline=(38, 42, 58),
+                width=1,
+            )
             bdraw.text((cx + 12, card_y + 9), cname, font=font_pct, fill=(142, 148, 168))
             pct_s = f"{round(cfrac * 100)}%"
             pb = bdraw.textbbox((0, 0), pct_s, font=font_pct)
-            bdraw.text((cx + card_w - 12 - (pb[2] - pb[0]), card_y + 9), pct_s, font=font_pct, fill=(255, 46, 126) if cfrac > 0 else (112, 118, 138))
+            bdraw.text(
+                (cx + card_w - 12 - (pb[2] - pb[0]), card_y + 9),
+                pct_s,
+                font=font_pct,
+                fill=(255, 46, 126) if cfrac > 0 else (112, 118, 138),
+            )
             bdraw.text((cx + 12, card_y + 27), cval[:28], font=font_track, fill=(235, 238, 245))
-            # Mini-barra dentro do card
             mx0, my0, mw, mh = cx + 12, card_y + 48, card_w - 24, 5
             bdraw.rounded_rectangle([mx0, my0, mx0 + mw, my0 + mh], radius=2, fill=(38, 42, 58))
             fw = int(round(mw * clamp01(cfrac)))
@@ -910,7 +870,7 @@ def main() -> None:
     try:
         data = fetch_tracker()
         ov = compute_overall(data.get("efforts", []))
-        pinned = get_pinned_message(data)
+        pinned = fetch_pinned()
 
         current = ov["score"]
         leader = ov["leader"]
