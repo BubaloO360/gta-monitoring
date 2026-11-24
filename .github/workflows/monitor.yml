@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:
+    inputs:
+      test_notification:
+        description: "Enviar alerta de teste no Discord (não altera state.json)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -22,13 +27,12 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: |
-          pip install requests playwright
-          playwright install --with-deps chromium
+        run: pip install requests
 
       - name: Run monitor script
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TEST_NOTIFICATION: ${{ inputs.test_notification }}
         run: python monitor.py
 
       - name: Commit state changes
