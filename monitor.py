@@ -751,4 +751,253 @@ def generate_progress_gif(ov: dict) -> bytes | None:
         stb = fdraw.textbbox((0, 0), score_txt, font=font_score)
         fdraw.text((BAR_X + BAR_W - (stb[2] - stb[0]), 14), score_txt, font=font_score, fill=(255, 46, 126))
 
-        _draw_progress_bar(frame, fdraw, grad1, BAR_X, BAR1
+        _draw_progress_bar(frame, fdraw, grad1, BAR_X, BAR1_Y, BAR_W, BAR1_H, val, BG)
+        _draw_progress_bar(frame, fdraw, grad2, BAR_X, BAR2_Y, BAR_W, BAR2_H, val, BG)
+
+        frames.append(frame.convert("P", palette=Image.ADAPTIVE, colors=128))
+        durations.append(6000 if step == total_steps else 55)
+
+    buf = io.BytesIO()
+    frames[0].save(
+        buf,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=0,
+        optimize=True,
+    )
+    return buf.getvalue()
+
+
+# ---------- Envio para o Discord ----------
+
+def _build_multipart(payload: dict, file_bytes: bytes, filename: str) -> tuple[bytes, str]:
+    boundary = f"----PortwatchBoundary{uuid.uuid4().hex}"
+    parts = [
+        f"--{boundary}\r\n".encode("utf-8"),
+        b'Content-Disposition: form-data; name="payload_json"\r\n',
+        b"Content-Type: application/json; charset=utf-8\r\n\r\n",
+        json.dumps(payload).encode("utf-8"),
+        b"\r\n",
+        f"--{boundary}\r\n".encode("utf-8"),
+        f'Content-Disposition: form-data; name="files[0]"; filename="{filename}"\r\n'.encode("utf-8"),
+        b"Content-Type: image/gif\r\n\r\n",
+        file_bytes,
+        b"\r\n",
+        f"--{boundary}--\r\n".encode("utf-8"),
+    ]
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def send_discord_alert(
+    webhook_url: str,
+    title: str,
+    ov: dict,
+    previous_value: float | None,
+    pinned: dict | None,
+    pin_is_new: bool,
+    color: int,
+) -> None:
+    current_value = ov["score"]
+    leader = ov["leader"]
+    effort = leader["effort"] if leader else {}
+    leader_name = effort.get("name", "Desconhecido")
+    reached_label = leader["reached_label"] if leader else "-"
+
+    formatted_now = f"{current_value:g}%"
+    if previous_value is not None and current_value != previous_value:
+        diff = js_round_1(current_value - previous_value)
+        sign = "+" if diff > 0 else ""
+        progress_str = f"{previous_value:g}% → **{formatted_now}** ({sign}{diff:g}%)"
+    else:
+        progress_str = f"**{formatted_now}**"
+
+    summary_pt = translate_ptbr(effort.get("summary", ""))
+    description = f"Progresso geral: {progress_str}."
+    if summary_pt:
+        description += f"\n\n{summary_pt}"
+
+    fields = []
+
+    if pinned and pinned.get("text"):
+        pin_pt = translate_ptbr(pinned["text"])
+        pin_title = f"📌 Recado fixado — {pinned.get('author', 'Criador')}"
+        if pin_is_new:
+            pin_title += " (NOVO)"
+        fields.append({"name": pin_title, "value": pin_pt[:1000], "inline": False})
+
+    fields.extend([
+        {"name": "Projeto líder", "value": leader_name, "inline": True},
+        {"name": "Marco atual", "value": reached_label, "inline": True},
+    ])
+
+    gta = effort.get("gta") or {}
+    if gta.get("fps"):
+        fields.append({"name": "Desempenho", "value": f"{round(float(gta['fps']))} FPS", "inline": True})
+    elif gta.get("stability") and gta["stability"] != "unknown":
+        stab_pt = STABILITY_LABEL_PT.get(gta["stability"], gta["stability"])
+        fields.append({"name": "Estabilidade", "value": stab_pt, "inline": True})
+
+    works_text = format_bullet_list(effort.get("highlights") or [], "✅")
+    if works_text:
+        fields.append({"name": "O que funciona", "value": works_text, "inline": False})
+
+    blockers_text = format_bullet_list(effort.get("blockers") or [], "⛔")
+    if blockers_text:
+        fields.append({"name": "O que está travando", "value": blockers_text, "inline": False})
+
+    gif_bytes = None
+    try:
+        gif_bytes = generate_progress_gif(ov)
+    except Exception as exc:
+        print(f"AVISO ao gerar GIF de progresso: {type(exc).__name__}", file=sys.stderr)
+
+    embed = {
+        "title": title,
+        "description": description[:4000],
+        "url": DISPLAY_URL,
+        "color": color,
+        "fields": fields,
+    }
+    if gif_bytes:
+        embed["image"] = {"url": "attachment://progresso.gif"}
+    if effort.get("assessedAt"):
+        embed["footer"] = {"text": f"Revisado em {effort['assessedAt']}"}
+
+    payload = {
+        "username": "Portwatch VI Monitor",
+        "embeds": [embed],
+    }
+
+    if gif_bytes:
+        body, content_type = _build_multipart(payload, gif_bytes, "progresso.gif")
+    else:
+        body = json.dumps(payload).encode("utf-8")
+        content_type = "application/json"
+
+    req = urllib.request.Request(
+        webhook_url,
+        data=body,
+        headers={
+            "Content-Type": content_type,
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            if not (200 <= resp.status < 300):
+                raise RuntimeError(f"Discord retornou status inesperado: HTTP {resp.status}.")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Falha ao enviar alerta ao Discord (HTTP {exc.code}).") from None
+    except urllib.error.URLError:
+        raise RuntimeError("Falha de conexão ao enviar alerta ao Discord.") from None
+    except OSError:
+        raise RuntimeError("Erro de rede/timeout ao enviar alerta ao Discord.") from None
+
+
+def main() -> None:
+    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    if not webhook_url:
+        print("ERRO: variável DISCORD_WEBHOOK_URL não configurada.", file=sys.stderr)
+        sys.exit(1)
+
+    test_mode = os.environ.get("TEST_NOTIFICATION", "").lower() == "true"
+    state = load_state()
+
+    try:
+        data = fetch_tracker()
+        ov = compute_overall(data.get("efforts", []))
+        pinned = get_pinned_message(data)
+
+        current = ov["score"]
+        leader = ov["leader"]
+        leader_id = leader["effort"].get("id") if leader else None
+        leader_name = leader["effort"].get("name") if leader else "Nenhum"
+        pin_key = f"{pinned['datetime']}|{pinned['text']}" if pinned else None
+
+        print(f"Score atual (#ov-score): {current:g}% | Líder: {leader_name}")
+        if pinned:
+            print(f"Fixado detectado ({pinned['author']}): {pinned['text'][:60]}...")
+
+        if test_mode:
+            send_discord_alert(
+                webhook_url,
+                f"Teste Portwatch VI — {current:g}% ({leader_name})",
+                ov,
+                state["last_score"],
+                pinned,
+                pin_is_new=bool(pinned),
+                color=0x3498DB,
+            )
+            print("Notificação de teste enviada no Discord (state.json não alterado).")
+            return
+
+        last_score = state["last_score"]
+
+        if last_score is None:
+            state["last_score"] = current
+            state["last_leader"] = leader_id
+            state["last_pin_key"] = pin_key
+            state["notified_90"] = current >= 90.0
+            state["notified_100"] = current >= 100.0
+            save_state(state)
+            print(f"Estado inicial salvo em {current:g}% ({leader_name}).")
+            return
+
+        score_up = current > last_score
+        score_down = current < last_score
+        pin_changed = bool(pin_key and pin_key != state.get("last_pin_key"))
+
+        if not (score_up or score_down or pin_changed):
+            print(f"Sem mudanças (atual: {current:g}% | último registrado: {last_score:g}%).")
+            return
+
+        if score_up and current >= 100.0 and not state["notified_100"]:
+            title = f"🎉 MARCO 100%! {leader_name} atingiu {current:g}%"
+            color = 0x2ECC71
+            state["notified_100"] = True
+            state["notified_90"] = True
+        elif score_up and current >= 90.0 and not state["notified_90"]:
+            title = f"🔥 MARCO 90%! {leader_name} atingiu {current:g}%"
+            color = 0xF1C40F
+            state["notified_90"] = True
+        elif score_up:
+            title = f"📈 Novo avanço no Portwatch VI: {last_score:g}% → {current:g}%"
+            color = 0xFF2E7E
+        elif score_down:
+            title = f"🔄 Recalibração no Portwatch VI: {last_score:g}% → {current:g}%"
+            color = 0x9B59B6
+            if current < 90.0:
+                state["notified_90"] = False
+            if current < 100.0:
+                state["notified_100"] = False
+        else:
+            author = pinned["author"] if pinned else "Criador"
+            title = f"📌 Novo recado fixado de {author} no Portwatch VI"
+            color = 0xE67E22
+
+        send_discord_alert(
+            webhook_url,
+            title,
+            ov,
+            last_score,
+            pinned,
+            pin_is_new=pin_changed,
+            color=color,
+        )
+        state["last_score"] = current
+        state["last_leader"] = leader_id
+        if pin_key:
+            state["last_pin_key"] = pin_key
+        save_state(state)
+        print(f"Alerta enviado ({last_score:g}% -> {current:g}% | pin_changed={pin_changed}).")
+    except RuntimeError as exc:
+        print(f"ERRO: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
