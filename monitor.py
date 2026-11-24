@@ -19,13 +19,13 @@ USER_AGENT = (
 )
 
 MILESTONES = [
-    ("groundwork", "Groundwork", 0),
-    ("loads", "Exe runs", 25),
-    ("boots", "First frame", 40),
-    ("menu", "Main menu", 55),
-    ("ingame", "In-game", 70),
+    ("groundwork", "Preparação", 0),
+    ("loads", "Exe rodando", 25),
+    ("boots", "Primeiro frame", 40),
+    ("menu", "Menu principal", 55),
+    ("ingame", "Dentro do jogo", 70),
     ("fps30", "30 FPS", 85),
-    ("stable", "Stable", 100),
+    ("stable", "Estável", 100),
 ]
 TICK = {key: at for key, _, at in MILESTONES}
 MILESTONE_LABEL = {key: label for key, label, _ in MILESTONES}
@@ -45,6 +45,15 @@ STABILITY = {
     "sometimes": 0.55,
     "rarely": 0.8,
     "stable": 1.0,
+}
+
+STABILITY_LABEL_PT = {
+    "unknown": "Desconhecida",
+    "constant": "Trava constantemente",
+    "often": "Trava com frequência",
+    "sometimes": "Trava às vezes",
+    "rarely": "Raramente trava",
+    "stable": "Estável",
 }
 
 
@@ -137,9 +146,16 @@ def compute_overall(efforts: list[dict]) -> dict:
 
 
 def load_state() -> dict:
+    default = {
+        "last_score": None,
+        "last_leader": None,
+        "notified_90": False,
+        "notified_100": False,
+    }
     if not STATE_FILE.exists():
-        return {"notified_90": False, "notified_100": False}
-    return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return default
+    raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    return {**default, **raw}
 
 
 def save_state(state: dict) -> None:
@@ -168,32 +184,93 @@ def fetch_tracker() -> dict:
         raise RuntimeError("Resposta inválida (JSON corrompido) em tracker.json.") from None
 
 
+def translate_ptbr(text: str) -> str:
+    clean = (text or "").strip()
+    if not clean:
+        return ""
+    params = urllib.parse.urlencode(
+        {"client": "gtx", "sl": "en", "tl": "pt", "dt": "t", "q": clean}
+    )
+    req = urllib.request.Request(
+        f"https://translate.googleapis.com/translate_a/single?{params}",
+        headers={"User-Agent": USER_AGENT},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        translated = "".join(part[0] for part in data[0] if part and part[0])
+        return translated.strip() or clean
+    except Exception:
+        return clean
+
+
+def format_bullet_list(items: list[str], prefix: str, max_len: int = 950) -> str:
+    if not items:
+        return ""
+    lines = [f"{prefix} {translate_ptbr(item)}" for item in items[:5] if str(item).strip()]
+    joined = "\n".join(lines)
+    if len(joined) > max_len:
+        return joined[: max_len - 3].rstrip() + "..."
+    return joined
+
+
 def send_discord_alert(
     webhook_url: str,
     title: str,
     current_value: float,
+    previous_value: float | None,
     leader: dict | None,
     color: int,
 ) -> None:
-    formatted = f"{current_value:g}%"
-    leader_name = leader["effort"].get("name", "Desconhecido") if leader else "Nenhum"
+    effort = leader["effort"] if leader else {}
+    leader_name = effort.get("name", "Desconhecido")
     reached_label = leader["reached_label"] if leader else "-"
+
+    formatted_now = f"{current_value:g}%"
+    if previous_value is not None and current_value > previous_value:
+        progress_str = f"{previous_value:g}% → **{formatted_now}** (+{current_value - previous_value:g}%)"
+    else:
+        progress_str = f"**{formatted_now}**"
+
+    summary_pt = translate_ptbr(effort.get("summary", ""))
+    description = f"O progresso geral chegou a {progress_str}."
+    if summary_pt:
+        description += f"\n\n{summary_pt}"
+
+    fields = [
+        {"name": "Projeto líder", "value": leader_name, "inline": True},
+        {"name": "Marco atual", "value": reached_label, "inline": True},
+    ]
+
+    gta = effort.get("gta") or {}
+    if gta.get("fps"):
+        fields.append({"name": "Desempenho", "value": f"{round(float(gta['fps']))} FPS", "inline": True})
+    elif gta.get("stability") and gta["stability"] != "unknown":
+        stab_pt = STABILITY_LABEL_PT.get(gta["stability"], gta["stability"])
+        fields.append({"name": "Estabilidade", "value": stab_pt, "inline": True})
+
+    works_text = format_bullet_list(effort.get("highlights") or [], "✅")
+    if works_text:
+        fields.append({"name": "O que funciona", "value": works_text, "inline": False})
+
+    blockers_text = format_bullet_list(effort.get("blockers") or [], "⛔")
+    if blockers_text:
+        fields.append({"name": "O que está travando", "value": blockers_text, "inline": False})
+
+    embed = {
+        "title": title,
+        "description": description[:4000],
+        "url": DISPLAY_URL,
+        "color": color,
+        "fields": fields,
+    }
+    if effort.get("assessedAt"):
+        embed["footer"] = {"text": f"Revisado em {effort['assessedAt']}"}
 
     payload = {
         "username": "Portwatch VI Monitor",
-        "embeds": [
-            {
-                "title": title,
-                "description": f"O progresso geral (`#ov-score`) chegou a **{formatted}**.",
-                "url": DISPLAY_URL,
-                "color": color,
-                "fields": [
-                    {"name": "Progresso", "value": formatted, "inline": True},
-                    {"name": "Projeto líder", "value": leader_name, "inline": True},
-                    {"name": "Marco atual", "value": reached_label, "inline": True},
-                ],
-            }
-        ],
+        "embeds": [embed],
     }
 
     body = json.dumps(payload).encode("utf-8")
@@ -207,7 +284,6 @@ def send_discord_alert(
         method="POST",
     )
 
-    # Captura qualquer erro sem propagar exceção original (que conteria a URL do webhook).
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             if not (200 <= resp.status < 300):
@@ -227,17 +303,14 @@ def main() -> None:
         sys.exit(1)
 
     test_mode = os.environ.get("TEST_NOTIFICATION", "").lower() == "true"
-
     state = load_state()
-    if not test_mode and state.get("notified_90") and state.get("notified_100"):
-        print("Marcos de 90% e 100% já notificados. Encerrando.")
-        return
 
     try:
         data = fetch_tracker()
         ov = compute_overall(data.get("efforts", []))
         current = ov["score"]
         leader = ov["leader"]
+        leader_id = leader["effort"].get("id") if leader else None
         leader_name = leader["effort"].get("name") if leader else "Nenhum"
 
         print(f"Score atual (#ov-score): {current:g}% | Líder: {leader_name}")
@@ -245,31 +318,50 @@ def main() -> None:
         if test_mode:
             send_discord_alert(
                 webhook_url,
-                "Teste de monitoramento Portwatch VI",
+                f"Teste Portwatch VI — {current:g}% ({leader_name})",
                 current,
+                state["last_score"],
                 leader,
                 0x3498DB,
             )
             print("Notificação de teste enviada no Discord (state.json não alterado).")
             return
 
-        changed = False
+        last_score = state["last_score"]
+
+        # Primeira execução após atualizar o script: inicializa o estado sem disparar alerta falso
+        if last_score is None:
+            state["last_score"] = current
+            state["last_leader"] = leader_id
+            state["notified_90"] = current >= 90.0
+            state["notified_100"] = current >= 100.0
+            save_state(state)
+            print(f"Estado inicial salvo em {current:g}% ({leader_name}).")
+            return
+
+        advanced = current > last_score
+        if not advanced:
+            print(f"Sem avanço (atual: {current:g}% | último registrado: {last_score:g}%).")
+            return
+
         if current >= 100.0 and not state["notified_100"]:
-            send_discord_alert(webhook_url, "Progresso atingiu 100%!", current, leader, 0x2ECC71)
+            title = f"🎉 MARCO 100%! {leader_name} atingiu {current:g}%"
+            color = 0x2ECC71
             state["notified_100"] = True
             state["notified_90"] = True
-            changed = True
-            print("Alerta de 100% enviado.")
         elif current >= 90.0 and not state["notified_90"]:
-            send_discord_alert(webhook_url, "Progresso atingiu 90%!", current, leader, 0xF1C40F)
+            title = f"🔥 MARCO 90%! {leader_name} atingiu {current:g}%"
+            color = 0xF1C40F
             state["notified_90"] = True
-            changed = True
-            print("Alerta de 90% enviado.")
         else:
-            print("Nenhum marco novo atingido. Nenhuma notificação enviada.")
+            title = f"📈 Novo avanço no Portwatch VI: {last_score:g}% → {current:g}%"
+            color = 0xFF2E7E
 
-        if changed:
-            save_state(state)
+        send_discord_alert(webhook_url, title, current, last_score, leader, color)
+        state["last_score"] = current
+        state["last_leader"] = leader_id
+        save_state(state)
+        print(f"Alerta de avanço enviado ({last_score:g}% -> {current:g}%).")
     except RuntimeError as exc:
         print(f"ERRO: {exc}", file=sys.stderr)
         sys.exit(1)
