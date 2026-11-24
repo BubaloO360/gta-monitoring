@@ -184,25 +184,78 @@ def fetch_tracker() -> dict:
         raise RuntimeError("Resposta inválida (JSON corrompido) em tracker.json.") from None
 
 
-def translate_ptbr(text: str) -> str:
-    clean = (text or "").strip()
-    if not clean:
-        return ""
+def _translate_mymemory(text: str) -> str | None:
+    params = urllib.parse.urlencode({"q": text[:500], "langpair": "en|pt-BR"})
+    req = urllib.request.Request(
+        f"https://api.mymemory.translated.net/get?{params}",
+        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if data.get("responseStatus") != 200:
+        return None
+    translated = (data.get("responseData") or {}).get("translatedText", "").strip()
+    if not translated or "MYMEMORY WARNING" in translated.upper():
+        return None
+    return translated
+
+
+def _translate_google_clients5(text: str) -> str | None:
     params = urllib.parse.urlencode(
-        {"client": "gtx", "sl": "en", "tl": "pt", "dt": "t", "q": clean}
+        {"client": "dict-chrome-ex", "sl": "en", "tl": "pt-BR", "q": text}
+    )
+    req = urllib.request.Request(
+        f"https://clients5.google.com/translate_a/t?{params}",
+        headers={"User-Agent": USER_AGENT},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if isinstance(data, list) and data:
+        first = data[0]
+        if isinstance(first, str):
+            return first.strip() or None
+        if isinstance(first, list) and first and isinstance(first[0], str):
+            return first[0].strip() or None
+    return None
+
+
+def _translate_google_gtx(text: str) -> str | None:
+    params = urllib.parse.urlencode(
+        {"client": "gtx", "sl": "en", "tl": "pt-BR", "dt": "t", "q": text}
     )
     req = urllib.request.Request(
         f"https://translate.googleapis.com/translate_a/single?{params}",
         headers={"User-Agent": USER_AGENT},
         method="GET",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        translated = "".join(part[0] for part in data[0] if part and part[0])
-        return translated.strip() or clean
-    except Exception:
-        return clean
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    translated = "".join(part[0] for part in data[0] if part and part[0]).strip()
+    return translated or None
+
+
+def translate_ptbr(text: str) -> str:
+    clean = (text or "").strip()
+    if not clean:
+        return ""
+
+    providers = (
+        ("MyMemory", _translate_mymemory),
+        ("Google-clients5", _translate_google_clients5),
+        ("Google-gtx", _translate_google_gtx),
+    )
+
+    for name, fn in providers:
+        try:
+            result = fn(clean)
+            if result:
+                return result
+        except Exception as exc:
+            print(f"AVISO tradução ({name}): {type(exc).__name__}", file=sys.stderr)
+
+    return clean
 
 
 def format_bullet_list(items: list[str], prefix: str, max_len: int = 950) -> str:
