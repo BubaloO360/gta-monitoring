@@ -1,18 +1,132 @@
 import json
+import math
 import os
-import re
 import sys
 import time
 from pathlib import Path
 
 import requests
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
 
-TARGET_URL = "https://portwatch-vi.xyz/"
+TRACKER_URL = "https://portwatch-vi.xyz/data/tracker.json"
 DISPLAY_URL = "https://portwatch-vi.xyz/#top"
 STATE_FILE = Path("state.json")
-CSS_SELECTOR = "#ov-score"
+
+MILESTONES = [
+    ("groundwork", "Groundwork", 0),
+    ("loads", "Exe runs", 25),
+    ("boots", "First frame", 40),
+    ("menu", "Main menu", 55),
+    ("ingame", "In-game", 70),
+    ("fps30", "30 FPS", 85),
+    ("stable", "Stable", 100),
+]
+TICK = {key: at for key, _, at in MILESTONES}
+MILESTONE_LABEL = {key: label for key, label, _ in MILESTONES}
+LADDER = ["loads", "boots", "menu", "ingame"]
+
+GROUNDWORK = [
+    ("loader", 0.2),
+    ("shaders", 0.28),
+    ("graphics", 0.32),
+    ("proven", 0.2),
+]
+
+STABILITY = {
+    "unknown": 0.0,
+    "constant": 0.0,
+    "often": 0.25,
+    "sometimes": 0.55,
+    "rarely": 0.8,
+    "stable": 1.0,
+}
+
+
+def js_round_1(value: float) -> float:
+    return math.floor(value * 10 + 0.5) / 10
+
+
+def clamp01(value) -> float:
+    if value is None:
+        return 0.0
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(num):
+        return 0.0
+    return min(1.0, max(0.0, num))
+
+
+def ladder_value(value) -> float:
+    if value is True:
+        return 1.0
+    if value is False or value is None:
+        return 0.0
+    return clamp01(value)
+
+
+def groundwork_fraction(gw) -> float:
+    if not isinstance(gw, dict):
+        return 0.0
+    return sum(weight * clamp01(gw.get(key)) for key, weight in GROUNDWORK)
+
+
+def score_effort(effort: dict) -> dict:
+    gw = groundwork_fraction(effort.get("groundwork"))
+    gta = effort.get("gta") or {}
+    score = TICK["loads"] * gw
+    reached = "groundwork"
+    prev_tick = score
+
+    for key in LADDER:
+        v = ladder_value(gta.get(key))
+        if v >= 1.0:
+            score = float(TICK[key])
+            prev_tick = score
+            reached = key
+            continue
+        if v > 0.0:
+            score = max(score, prev_tick + v * (TICK[key] - prev_tick))
+        break
+
+    if reached == "ingame":
+        try:
+            fps_num = float(gta.get("fps") or 0)
+        except (TypeError, ValueError):
+            fps_num = 0.0
+        fps = clamp01(fps_num / 30.0)
+        stab = STABILITY.get(gta.get("stability"), STABILITY["unknown"])
+        score = (
+            TICK["ingame"]
+            + fps * (TICK["fps30"] - TICK["ingame"])
+            + stab * (TICK["stable"] - TICK["fps30"])
+        )
+        if fps >= 1.0:
+            reached = "fps30"
+        if fps >= 1.0 and stab >= 1.0:
+            reached = "stable"
+
+    return {
+        "score": js_round_1(score),
+        "reached": reached,
+        "reached_label": MILESTONE_LABEL[reached],
+    }
+
+
+def compute_overall(efforts: list[dict]) -> dict:
+    scored = []
+    for effort in efforts:
+        if effort.get("nuked"):
+            continue
+        stars = (effort.get("stats") or {}).get("stars") or 0
+        scored.append({"effort": effort, "stars": stars, **score_effort(effort)})
+
+    scored.sort(key=lambda item: (-item["score"], -item["stars"]))
+    leader = scored[0] if scored else None
+    return {
+        "leader": leader,
+        "score": leader["score"] if leader else 0.0,
+    }
 
 
 def load_state() -> dict:
@@ -25,78 +139,49 @@ def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
 
-def parse_score(raw_text: str) -> float | None:
-    match = re.search(r"\d+(?:[.,]\d+)?", raw_text.strip())
-    if not match:
-        return None
-    value = float(match.group(0).replace(",", "."))
-    return value if 0.0 <= value <= 100.0 else None
+def fetch_tracker() -> dict:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/145.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, */*",
+        "Referer": "https://portwatch-vi.xyz/",
+    }
+    resp = requests.get(
+        TRACKER_URL,
+        params={"ts": int(time.time() // 60)},
+        headers=headers,
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
-def fetch_rendered_score(url: str) -> float | None:
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            )
-        )
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
-
-        locator = page.locator(CSS_SELECTOR).first
-        locator.wait_for(state="attached", timeout=15000)
-        locator.scroll_into_view_if_needed()
-
-        # Aguarda o JavaScript atualizar o valor inicial (0) para o valor real
-        try:
-            page.wait_for_function(
-                """(selector) => {
-                    const el = document.querySelector(selector);
-                    if (!el) return false;
-                    const val = parseFloat(el.textContent.replace(',', '.').trim());
-                    return !isNaN(val) && val > 0;
-                }""",
-                arg=CSS_SELECTOR,
-                timeout=15000,
-            )
-        except PlaywrightTimeoutError:
-            pass
-
-        # Aguarda o número estabilizar (evita capturar meio da animação de contagem)
-        last_val = None
-        stable_reads = 0
-        for _ in range(14):  # até 7 segundos
-            raw = locator.inner_text()
-            current_val = parse_score(raw)
-            if current_val is not None and current_val == last_val:
-                stable_reads += 1
-                if stable_reads >= 3:
-                    break
-            else:
-                stable_reads = 0
-                last_val = current_val
-            time.sleep(0.5)
-
-        browser.close()
-        return last_val
-
-
-def send_discord_alert(webhook_url: str, milestone: int, current_value: float) -> None:
-    is_complete = milestone == 100
+def send_discord_alert(
+    webhook_url: str,
+    title: str,
+    current_value: float,
+    leader: dict | None,
+    color: int,
+) -> None:
     formatted = f"{current_value:g}%"
+    leader_name = leader["effort"].get("name", "Desconhecido") if leader else "Nenhum"
+    reached_label = leader["reached_label"] if leader else "-"
+
     payload = {
         "username": "Portwatch VI Monitor",
         "embeds": [
             {
-                "title": f"Progresso atingiu {milestone}%!",
-                "description": f"O marcador `#ov-score` do site chegou a **{formatted}**.",
+                "title": title,
+                "description": f"O progresso geral (`#ov-score`) chegou a **{formatted}**.",
                 "url": DISPLAY_URL,
-                "color": 0x2ECC71 if is_complete else 0xF1C40F,
+                "color": color,
                 "fields": [
-                    {"name": "Marco", "value": f"{milestone}%", "inline": True},
-                    {"name": "Valor lido", "value": formatted, "inline": True},
+                    {"name": "Progresso", "value": formatted, "inline": True},
+                    {"name": "Projeto líder", "value": leader_name, "inline": True},
+                    {"name": "Marco atual", "value": reached_label, "inline": True},
                 ],
             }
         ],
@@ -111,27 +196,41 @@ def main() -> None:
         print("ERRO: variável DISCORD_WEBHOOK_URL não configurada.", file=sys.stderr)
         sys.exit(1)
 
+    test_mode = os.environ.get("TEST_NOTIFICATION", "").lower() == "true"
+
     state = load_state()
-    if state.get("notified_90") and state.get("notified_100"):
+    if not test_mode and state.get("notified_90") and state.get("notified_100"):
         print("Marcos de 90% e 100% já notificados. Encerrando.")
         return
 
-    current = fetch_rendered_score(TARGET_URL)
-    if current is None:
-        print(f"ERRO: não foi possível ler um valor válido em '{CSS_SELECTOR}'.", file=sys.stderr)
-        sys.exit(1)
+    data = fetch_tracker()
+    ov = compute_overall(data.get("efforts", []))
+    current = ov["score"]
+    leader = ov["leader"]
+    leader_name = leader["effort"].get("name") if leader else "Nenhum"
 
-    print(f"Valor atual em {CSS_SELECTOR}: {current:g}%")
+    print(f"Score atual (#ov-score): {current:g}% | Líder: {leader_name}")
+
+    if test_mode:
+        send_discord_alert(
+            webhook_url,
+            "Teste de monitoramento Portwatch VI",
+            current,
+            leader,
+            0x3498DB,
+        )
+        print("Notificação de teste enviada no Discord (state.json não alterado).")
+        return
 
     changed = False
     if current >= 100.0 and not state["notified_100"]:
-        send_discord_alert(webhook_url, 100, current)
+        send_discord_alert(webhook_url, "Progresso atingiu 100%!", current, leader, 0x2ECC71)
         state["notified_100"] = True
         state["notified_90"] = True
         changed = True
         print("Alerta de 100% enviado.")
     elif current >= 90.0 and not state["notified_90"]:
-        send_discord_alert(webhook_url, 90, current)
+        send_discord_alert(webhook_url, "Progresso atingiu 90%!", current, leader, 0xF1C40F)
         state["notified_90"] = True
         changed = True
         print("Alerta de 90% enviado.")
