@@ -2,7 +2,7 @@ name: Monitor Portwatch VI
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "17,47 * * * *"
   workflow_dispatch:
     inputs:
       test_notification:
