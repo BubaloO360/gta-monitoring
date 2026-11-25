@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import math
@@ -18,6 +19,7 @@ except ImportError:
 SITE_URL = "https://portwatch-vi.xyz/"
 TRACKER_URL = "https://portwatch-vi.xyz/data/tracker.json"
 PINNED_URL = "https://portwatch-vi.xyz/data/pinned.json"
+SCORING_URL = "https://portwatch-vi.xyz/assets/js/scoring.js"
 DISPLAY_URL = "https://portwatch-vi.xyz/#top"
 STATE_FILE = Path("state.json")
 
@@ -92,6 +94,8 @@ STABILITY_LABEL_PT = {
 }
 
 
+# ---------- Cálculo de pontuação (espelho de scoring.js) ----------
+
 def js_round_1(value: float) -> float:
     return math.floor(value * 10 + 0.5) / 10
 
@@ -122,16 +126,35 @@ def groundwork_fraction(gw) -> float:
     return sum(weight * clamp01(gw.get(key)) for key, weight in GROUNDWORK)
 
 
+def stability_key(value) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        best = "constant"
+        for key, s_val in STABILITY.items():
+            if key == "unknown":
+                continue
+            if abs(s_val - value) <= abs(STABILITY[best] - value) + 1e-9:
+                best = key
+        return best
+    return value if value in STABILITY else "unknown"
+
+
 def track_values(gta: dict) -> dict:
     try:
         fps_num = float(gta.get("fps") or 0)
     except (TypeError, ValueError):
         fps_num = 0.0
+
+    stab_raw = gta.get("stability")
+    if isinstance(stab_raw, (int, float)) and not isinstance(stab_raw, bool):
+        stab_val = clamp01(stab_raw)
+    else:
+        stab_val = STABILITY.get(stab_raw, STABILITY["unknown"])
+
     return {
         "story": clamp01(gta.get("story")),
         "render": clamp01(gta.get("render")),
         "perf": clamp01(fps_num / 30.0),
-        "stability": STABILITY.get(gta.get("stability"), STABILITY["unknown"]),
+        "stability": stab_val,
     }
 
 
@@ -205,11 +228,15 @@ def compute_overall(efforts: list[dict]) -> dict:
     }
 
 
+# ---------- Estado local e requisições ----------
+
 def load_state() -> dict:
     default = {
         "last_score": None,
         "last_leader": None,
         "last_pin_key": None,
+        "last_scoring_sha": None,
+        "last_mismatch_key": None,
         "notified_90": False,
         "notified_100": False,
     }
@@ -224,12 +251,14 @@ def save_state(state: dict) -> None:
 
 
 def _fetch_json(url: str, label: str, required: bool = True) -> dict | None:
-    query = urllib.parse.urlencode({"ts": int(time.time() // 60)})
+    query = urllib.parse.urlencode({"ts": int(time.time())})
     req = urllib.request.Request(
         f"{url}?{query}",
         headers={
             "User-Agent": USER_AGENT,
             "Accept": "application/json, */*",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
             "Referer": SITE_URL,
         },
         method="GET",
@@ -270,6 +299,48 @@ def fetch_pinned() -> dict | None:
         "datetime": str(data.get("updated") or "").strip(),
         "text": text,
     }
+
+
+def fetch_scoring_sha() -> str | None:
+    query = urllib.parse.urlencode({"ts": int(time.time())})
+    req = urllib.request.Request(
+        f"{SCORING_URL}?{query}",
+        headers={
+            "User-Agent": USER_AGENT,
+            "Cache-Control": "no-cache",
+            "Referer": SITE_URL,
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return hashlib.sha256(resp.read()).hexdigest()[:16]
+    except Exception as exc:
+        print(f"AVISO ao consultar scoring.js: {type(exc).__name__}", file=sys.stderr)
+        return None
+
+
+def check_history_mismatch(data: dict, ov: dict) -> str | None:
+    history = data.get("history") or []
+    if not history:
+        return None
+    latest = history[-1]
+    updated_day = str(data.get("updated") or "")[:10]
+    if latest.get("date") != updated_day:
+        return None
+
+    site_score = latest.get("leader")
+    site_leader = latest.get("leaderId")
+    local_score = ov["score"]
+    local_leader = ov["leader"]["effort"].get("id") if ov["leader"] else None
+
+    diffs = []
+    if isinstance(site_score, (int, float)) and abs(float(site_score) - local_score) > 0.05:
+        diffs.append(f"Nota: site **{site_score:g}%** vs script **{local_score:g}%**")
+    if site_leader and local_leader and site_leader != local_leader:
+        diffs.append(f"Líder: site **{site_leader}** vs script **{local_leader}**")
+
+    return "\n".join(diffs) if diffs else None
 
 
 # ---------- Tradução PT-BR ----------
@@ -548,7 +619,6 @@ def generate_progress_gif(ov: dict) -> bytes | None:
     furthest_idx = ov.get("furthest_idx", 0)
     proj_items = _project_milestone_items(leader)
 
-    # Posicionamento sem sobreposição dos marcadores do Top 6
     top_ranked = ov.get("ranked", [])[:6]
     markers = []
     for r in top_ranked:
@@ -573,11 +643,9 @@ def generate_progress_gif(ov: dict) -> bytes | None:
     base = Image.new("RGB", (W, H), BG)
     bdraw = ImageDraw.Draw(base)
 
-    # Cabeçalho Seção 1
     bdraw.text((BAR_X, 18), "PROGRESSO GERAL", font=font_header, fill=(142, 148, 168))
     bdraw.line([(BAR_X, 218), (BAR_X + BAR_W, 218)], fill=(32, 36, 50), width=1)
 
-    # Marcadores do Top 6 acima da barra geral
     circle_y = 74
     circle_r = 14
     for m in markers:
@@ -618,7 +686,6 @@ def generate_progress_gif(ov: dict) -> bytes | None:
             )
             bdraw.text((px + 9, py + 4), pill_text, font=font_pill, fill=(242, 244, 248))
 
-    # Porcentagens + rótulos intercalados em 2 alturas (Barra Geral)
     for idx, (_, label, at) in enumerate(MILESTONES):
         mx = BAR_X + int(round((at / 100.0) * BAR_W))
         align = "left" if at == 0 else ("right" if at == 100 else "center")
@@ -636,12 +703,10 @@ def generate_progress_gif(ov: dict) -> bytes | None:
             bdraw.line([(mx, BAR1_Y + BAR1_H + 25), (mx, label_y - 3)], fill=(45, 50, 68), width=1)
         _draw_milestone_label(bdraw, mx, label_y, label, st, font_label, align)
 
-    # Cabeçalho Seção 2 (Projeto Líder)
     bdraw.text((BAR_X, 236), f"PROJETO LÍDER · {leader_name.upper()}", font=font_header, fill=(142, 148, 168))
     sb = bdraw.textbbox((0, 0), leader_label, font=font_header)
     bdraw.text((BAR_X + BAR_W - (sb[2] - sb[0]), 236), leader_label, font=font_header, fill=(198, 204, 218))
 
-    # Rótulos intercalados em 2 alturas (Barra do Projeto)
     for idx, (at, label, st) in enumerate(proj_items):
         mx = BAR_X + int(round((at / 100.0) * BAR_W))
         align = "left" if at == 0 else ("right" if at == 100 else "center")
@@ -651,13 +716,12 @@ def generate_progress_gif(ov: dict) -> bytes | None:
             bdraw.line([(mx, BAR2_Y + BAR2_H + 3), (mx, label_y - 3)], fill=(45, 50, 68), width=1)
         _draw_milestone_label(bdraw, mx, label_y, label, st, font_label, align)
 
-    # 4 trilhas de qualidade (50% -> 100%)
     if leader:
         gta = leader["effort"].get("gta") or {}
         tracks = leader.get("tracks") or {}
         fps_val = gta.get("fps")
         fps_str = f"{round(float(fps_val))} FPS" if fps_val else "0 FPS"
-        stab_str = STABILITY_LABEL_PT.get(gta.get("stability") or "unknown", "Desconhecida")
+        stab_str = STABILITY_LABEL_PT.get(stability_key(gta.get("stability")), "Desconhecida")
 
         cards = [
             ("História (35%)", track_step_label(STORY_STEPS_PT, tracks.get("story", 0)), tracks.get("story", 0)),
@@ -694,7 +758,6 @@ def generate_progress_gif(ov: dict) -> bytes | None:
             if fw > 0:
                 bdraw.rounded_rectangle([mx0, my0, mx0 + fw, my0 + mh], radius=2, fill=(255, 46, 126))
 
-    # Quadros da animação
     total_steps = 18
     frames = []
     durations = []
@@ -750,6 +813,32 @@ def _build_multipart(payload: dict, file_bytes: bytes, filename: str) -> tuple[b
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
+def send_system_warning(webhook_url: str, title: str, description: str) -> None:
+    payload = {
+        "username": "Portwatch VI Monitor",
+        "embeds": [
+            {
+                "title": title,
+                "description": description,
+                "url": SCORING_URL,
+                "color": 0xE74C3C,
+            }
+        ],
+    }
+    req = urllib.request.Request(
+        webhook_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            if not (200 <= resp.status < 300):
+                raise RuntimeError(f"Discord retornou HTTP {resp.status} no aviso de sistema.")
+    except Exception as exc:
+        print(f"AVISO ao enviar alerta de sistema ao Discord: {exc}", file=sys.stderr)
+
+
 def send_discord_alert(
     webhook_url: str,
     title: str,
@@ -795,8 +884,8 @@ def send_discord_alert(
     gta = effort.get("gta") or {}
     if gta.get("fps"):
         fields.append({"name": "Desempenho", "value": f"{round(float(gta['fps']))} FPS", "inline": True})
-    elif gta.get("stability") and gta["stability"] != "unknown":
-        stab_pt = STABILITY_LABEL_PT.get(gta["stability"], gta["stability"])
+    elif stability_key(gta.get("stability")) != "unknown":
+        stab_pt = STABILITY_LABEL_PT[stability_key(gta.get("stability"))]
         fields.append({"name": "Estabilidade", "value": stab_pt, "inline": True})
 
     works_text = format_bullet_list(effort.get("highlights") or [], "✅")
@@ -858,6 +947,8 @@ def send_discord_alert(
         raise RuntimeError("Erro de rede/timeout ao enviar alerta ao Discord.") from None
 
 
+# ---------- Fluxo principal ----------
+
 def main() -> None:
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
     if not webhook_url:
@@ -871,6 +962,8 @@ def main() -> None:
         data = fetch_tracker()
         ov = compute_overall(data.get("efforts", []))
         pinned = fetch_pinned()
+        scoring_sha = fetch_scoring_sha()
+        mismatch = check_history_mismatch(data, ov)
 
         current = ov["score"]
         leader = ov["leader"]
@@ -881,6 +974,10 @@ def main() -> None:
         print(f"Score atual (#ov-score): {current:g}% | Líder: {leader_name}")
         if pinned:
             print(f"Fixado detectado ({pinned['author']}): {pinned['text'][:60]}...")
+        if scoring_sha:
+            print(f"SHA-256 scoring.js: {scoring_sha}")
+        if mismatch:
+            print(f"AVISO divergência detectada:\n{mismatch}")
 
         if test_mode:
             send_discord_alert(
@@ -894,6 +991,36 @@ def main() -> None:
             )
             print("Notificação de teste enviada no Discord (state.json não alterado).")
             return
+
+        state_dirty = False
+
+        # Verificação 1: mudança no scoring.js
+        if scoring_sha:
+            if state.get("last_scoring_sha") is None:
+                state["last_scoring_sha"] = scoring_sha
+                state_dirty = True
+            elif scoring_sha != state.get("last_scoring_sha"):
+                send_system_warning(
+                    webhook_url,
+                    "⚠️ Fórmula do Portwatch VI alterada (scoring.js)",
+                    f"O arquivo `scoring.js` mudou (`{state['last_scoring_sha']}` → `{scoring_sha}`). "
+                    "Confira se o `monitor.py` precisa de ajuste.",
+                )
+                state["last_scoring_sha"] = scoring_sha
+                state_dirty = True
+
+        # Verificação 2: divergência entre cálculo local e history oficial
+        if mismatch and mismatch != state.get("last_mismatch_key"):
+            send_system_warning(
+                webhook_url,
+                "⚠️ Divergência no cálculo do Portwatch VI",
+                f"O cálculo local divergiu do `history` oficial do site:\n{mismatch}",
+            )
+            state["last_mismatch_key"] = mismatch
+            state_dirty = True
+        elif not mismatch and state.get("last_mismatch_key"):
+            state["last_mismatch_key"] = None
+            state_dirty = True
 
         last_score = state["last_score"]
 
@@ -912,6 +1039,8 @@ def main() -> None:
         pin_changed = bool(pin_key and pin_key != state.get("last_pin_key"))
 
         if not (score_up or score_down or pin_changed):
+            if state_dirty:
+                save_state(state)
             print(f"Sem mudanças (atual: {current:g}% | último registrado: {last_score:g}%).")
             return
 
