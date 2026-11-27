@@ -1,9 +1,9 @@
 {
-  "last_score": 91.3,
-  "last_leader": "belobug",
+  "last_score": 90.0,
+  "last_leader": "victory-nvidia",
   "last_pin_key": "2026-11-27T14:13:39Z|**Why the top score is stuck at 91.3%: it's rendering now, not FPS.**\n\nFPS is the easy part. Turn off ray tracing, render at a low resolution and upscale, and you can hit 60. On our scale anything past 30 fps doesn't count, and a blurry low-res picture costs rendering points.\n\nWhat's missing is a picture that looks like the console: full lighting, ray tracing, sharp textures. Like DexNom said, the way forward is fixing rendering.",
-  "last_scoring_sha": "9cb2e7c562bb0047",
-  "last_mismatch_key": null,
+  "last_scoring_sha": "581b718dd3bdfe1d",
+  "last_mismatch_key": "Nota: site **91.3%** vs script **90%**\nL\u00edder: site **belobug** vs script **victory-nvidia**",
   "notified_90": true,
   "notified_100": false
 }
