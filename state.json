@@ -1,7 +1,7 @@
 {
   "last_score": 91.3,
   "last_leader": "belobug",
-  "last_pin_key": "2026-11-26T23:57:46Z|**GTA 6 MULTIPLAYER ON PC IS REAL. PortWatch has confirmed it.** \ud83d\udd25\ud83d\udd25\ud83d\udd25\n\nHoly shit. Players, cars and proximity voice chat, all at a stable 25-30 fps.\n\nWatch it here:\nhttps://x.com/4lwayz_/status/2126083366600724566",
+  "last_pin_key": "2026-11-27T14:13:39Z|**Why the top score is stuck at 91.3%: it's rendering now, not FPS.**\n\nFPS is the easy part. Turn off ray tracing, render at a low resolution and upscale, and you can hit 60. On our scale anything past 30 fps doesn't count, and a blurry low-res picture costs rendering points.\n\nWhat's missing is a picture that looks like the console: full lighting, ray tracing, sharp textures. Like DexNom said, the way forward is fixing rendering.",
   "last_scoring_sha": "9cb2e7c562bb0047",
   "last_mismatch_key": null,
   "notified_90": true,
